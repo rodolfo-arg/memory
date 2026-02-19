@@ -1,0 +1,17 @@
+[
+  {
+    "project_id": "memory",
+    "query": "what command applies migrations",
+    "intent": "procedural",
+    "expected_contains": ["migrate deploy"],
+    "token_budget": 1000
+  },
+  {
+    "project_id": "memory",
+    "query": "what was the latest decision",
+    "intent": "semantic",
+    "expected_chunk_ids": [],
+    "expected_contains": ["decision"],
+    "token_budget": 1000
+  }
+]
