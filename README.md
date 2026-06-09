@@ -309,6 +309,8 @@ GET  /v1/memory/bootstrap
 POST /v1/memory/facts/upsert
 POST /v1/memory/chunks/feedback
 POST /v1/memory/compact
+GET  /v1/memory/graph
+GET  /ui/memory/graph
 GET  /v1/admin/stats
 POST /v1/admin/reembed
 POST /v1/admin/resummarize
@@ -351,13 +353,55 @@ memory/
 └── .env               # Local config (gitignored)
 ```
 
-**Storage:** SQLite with WAL mode + FTS5 for BM25 lexical search. Embedding vectors stored as JSON blobs. Qdrant optional for large deployments.
+### Storage
 
-**Retrieval:** Hybrid — dense cosine similarity (top-60) + BM25 lexical (top-60), RRF fusion, final top-10 returned to Claude. Explainability payloads written to `retrieval_logs`.
+SQLite with WAL mode — no external vector database required (Qdrant optional for large deployments).
 
-**Workers:** Two background processes run alongside the API. The embedding worker processes queued chunks; the compaction worker expires stale memory by TTL. Both auto-restart under launchd.
+- **Schema:** `conversations` → `messages` → `chunks` → `chunk_embeddings`, plus `memory_facts`, `conversation_summaries`, `jobs` (lease-based async queue), `retrieval_logs`, and `idempotency_keys` (see `db/migrations/`).
+- **Lexical index:** `chunks_fts` — an FTS5 virtual table over `chunk_text`, kept in sync via triggers, powering BM25 search.
+- **Vectors:** stored as JSON blobs in `chunk_embeddings.vector_json` alongside model name, dimensions, and distance metric. No sqlite-vec extension needed.
+- **Hardening:** WAL mode, `busy_timeout=5000`, per-request connections, expired job leases auto-reclaimed.
 
-**SQLite hardening:** WAL mode, `busy_timeout=5000`, per-request connections, embed queue with lease semantics (`pending|running|done|failed`), expired leases auto-reclaimed.
+### Embeddings
+
+- **Default provider:** Ollama with `nomic-embed-text` (384 dimensions), cosine similarity over L2-normalized vectors.
+- **Pluggable:** `MEMORY_EMBEDDING_PROVIDER` supports `ollama`, `mock` (deterministic, for tests), `openai`, and `tei`.
+- **Async:** ingest never blocks on embedding. Chunks are enqueued as `embed` jobs; `workers/embedding_worker.py` polls every 2 s and processes batches of 64 with lease semantics (`pending|running|done|failed`).
+
+### Chunking (`app/ingestion/chunker.py`)
+
+Two-phase strategy per message:
+
+1. **Sliding-window base chunks** — max 600 tokens with 80-token overlap, split on newline boundaries → `chunk_type='turn'` (importance 0.20).
+2. **High-signal extraction** — pattern-based capture of `decision` (importance 0.90), `command` (0.75–0.80), `error` (0.70), and `todo` (0.60) chunks.
+
+Every chunk is prefixed with `[project:{project_id}] [role:{role}]` for contextual grounding, and deduplicated by a SHA256 `chunk_hash` (idempotent re-ingest, no re-embedding of duplicates).
+
+### Retrieval (`app/retrieval/hybrid.py`)
+
+Hybrid dense + lexical with Reciprocal Rank Fusion:
+
+1. **BM25** via FTS5 (query sanitized and tokenized, top-60 candidates) in parallel with **dense** cosine similarity over project-scoped, non-archived chunks (top-60).
+2. **RRF fusion:** `1 / (rrf_k + rank)` with `rrf_k=60`; weights `dense=0.95`, `lexical=1.05`.
+3. **Post-fusion boosts:** recency `0.05 · exp(−days_old / 30)`, importance `0.10 · importance`, chunk-type bonus (fact/summary +0.10, decision +0.06, command/error +0.04), and intent match +0.08 (e.g. procedural → command).
+4. **Token-budget packing:** top-ranked chunks selected until the requested `token_budget` is filled (~4 chars/token estimate).
+
+No MMR or neural reranking — ranking is fully explainable, and every query writes its ranking debug payload to `retrieval_logs` for the eval harness.
+
+### Ingestion
+
+`SessionEnd` posts the transcript path to `/v1/memory/ingest/transcript`, which parses the JSONL **delta only** (line offsets tracked per transcript in `ingest_offsets`), applies secret redaction when `MEMORY_ENABLE_REDACTION=true`, chunks each message, stores with dedup, and enqueues embedding jobs. Batch endpoints support idempotency keys (72-hour cache).
+
+### Memory lifecycle & decay
+
+- **Project scoping:** every read and write is filtered by `project_id` (absolute project path) — no cross-project leakage.
+- **Trust levels:** chunks carry `trust_level` (`untrusted` for transcripts, `derived` for summaries, `trusted` for admin writes), returned in query metadata.
+- **Compaction:** `workers/compaction_worker.py` runs hourly — archives chunks older than `MEMORY_EPISODIC_TTL_DAYS` (default 30) with importance < 0.55, and emits derived `summary` chunks (importance 0.65) in their place. Archived chunks are excluded from retrieval.
+- **Recency decay** is applied at query time only — nothing is mutated by age except via compaction.
+
+### Workers
+
+Two background processes run alongside the API: the embedding worker (embed queue) and the compaction worker (TTL cleanup + summarization). Both auto-restart under launchd.
 
 ---
 
